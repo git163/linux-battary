@@ -58,9 +58,17 @@ show_status() {
 		"$([[ $ac == 1 ]] && echo 'USB 在线' || echo '未插电')" "$state"
 
 	echo "== 策略 =="
-	printf '  区间 %s~%s%%，连续 %s 次确认，采样 %ss   %s\n' \
+	local v_stop v_resume
+	v_stop=$(conf_var "$CONF" VOLT_STOP 0)
+	v_resume=$(conf_var "$CONF" VOLT_RESUME 0)
+	printf '  电量 %s~%s%%，连续 %s 次确认，采样 %ss   %s\n' \
 		"$cap_resume" "$cap_max" "$confirm" "$interval" \
 		"$(systemctl is-active $UNIT 2>/dev/null)"
+	if (( v_stop > 0 && v_resume > 0 )); then
+		printf '  电压 静置 %d.%03d V ~ 充电 %d.%03d V（满充判据）\n' \
+			$((v_resume / 1000000)) $(((v_resume % 1000000) / 1000)) \
+			$((v_stop / 1000000)) $(((v_stop % 1000000) / 1000))
+	fi
 
 	echo "== 日志 =="
 	local enabled file lines

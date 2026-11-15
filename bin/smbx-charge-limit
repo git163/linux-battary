@@ -1,8 +1,15 @@
 #!/bin/bash
-# smbx-charge-limit —— 把电池电量控制在 RESUME%~CAP% 之间（默认 70~80%）
-#   到 CAP 停充；掉到 RESUME 再放开；区间内不动（死区）；
-#   且需连续 CONFIRM 次采样满足条件才切换，避免在阈值附近来回断电/充电。
-#   低于 SAFETY 无条件充电（不等待确认）。
+# smbx-charge-limit —— 把电池控制在 RESUME%~CAP% 之间（百分比粗档 + 电压精调）
+#
+#   停充：电量 ≥ CAP          或 充电中电压 ≥ VOLT_STOP
+#   恢复：电量 ≤ RESUME       或 静置(|I| ≤ LOAD_QUIET)时电压 ≤ VOLT_RESUME
+#   低于 SAFETY 无条件充电（不等确认）
+#
+#   两个防抖门槛：
+#     · 连续 CONFIRM 次采样条件一致才切换（默认 2 次）
+#     · |I| > LOAD_FREEZE 视为重载，冻结判定（电压被负载拉低不可信），
+#       负载回落后自动恢复判定
+#
 #   若 /run/smbx-drain.active 存在且未超时，仅做兜底，不干预 USB 输入。
 set -u
 
@@ -12,22 +19,27 @@ USB=$PARAM_DIR/usb_input
 BAT=/sys/class/power_supply/qcom-battery
 CHARGER=/sys/class/power_supply/pm8150b-charger
 DRAIN_FLAG=/run/smbx-drain.active
+NO_MODULE=/run/smbx-charge-limit.no-module
 CONF=${CONF:-/etc/default/smbx-charge-limit}
 
 # shellcheck source=/dev/null
 [[ -r $CONF ]] && . "$CONF"
 
-CAP=${CAP:-80}          # 上限：到这里停止充电
-RESUME=${RESUME:-70}    # 下限：掉到这里恢复充电
-SAFETY=${SAFETY:-40}    # 安全线：低于此值无条件充电
-INTERVAL=${INTERVAL:-60}
-CONFIRM=${CONFIRM:-2}   # 连续多少次采样满足条件才切换
-DRAIN_MAX_AGE=${DRAIN_MAX_AGE:-43200}   # 放电模式最长 12h，超时强制恢复
+CAP=${CAP:-80}                 # 上限（%）：到这里停止充电
+RESUME=${RESUME:-70}           # 下限（%）：掉到这里恢复充电
+SAFETY=${SAFETY:-40}           # 安全线（%）：低于此值无条件充电
+INTERVAL=${INTERVAL:-60}       # 采样间隔（秒）
+CONFIRM=${CONFIRM:-2}          # 连续多少次采样一致才切换
+VOLT_STOP=${VOLT_STOP:-4130000}     # 充电中电压 ≥ 此值（µV）停充；0 = 只用百分比
+VOLT_RESUME=${VOLT_RESUME:-4050000} # 静置电压 ≤ 此值（µV）恢复；0 = 只用百分比
+LOAD_QUIET=${LOAD_QUIET:-80}        # |I| ≤ 此值（mA）算静置，才用电压判恢复
+LOAD_FREEZE=${LOAD_FREEZE:-300}     # |I| > 此值（mA）冻结判定
+DRAIN_MAX_AGE=${DRAIN_MAX_AGE:-43200}
 
 log() { logger -t smbx-charge-limit -- "$*"; echo "$(date '+%F %T') $*"; }
+volt() { printf '%d.%03d' $(( $1 / 1000000 )) $(( ($1 % 1000000) / 1000 )); }
 
 # 模块不在（多半是内核升级后没重编）：只报一次，避免 systemd 反复重启刷日志
-NO_MODULE=/run/smbx-charge-limit.no-module
 if [[ ! -w $CHG || ! -w $USB ]]; then
 	if [[ ! -f $NO_MODULE ]]; then
 		log "smbx_ctl 模块未加载，暂停工作。重编后 systemctl restart smbx-charge-limit"
@@ -38,14 +50,19 @@ if [[ ! -w $CHG || ! -w $USB ]]; then
 fi
 rm -f "$NO_MODULE"
 
-log "启动：区间 ${RESUME}~${CAP}%（死区，连续 ${CONFIRM} 次确认才切换），安全线 ${SAFETY}%，采样 ${INTERVAL}s"
+if (( VOLT_STOP > 0 && VOLT_RESUME > 0 )); then
+	log "启动：区间 ${RESUME}~${CAP}%，电压 $(volt "$VOLT_RESUME")~$(volt "$VOLT_STOP")V（静置 ≤${LOAD_QUIET}mA / 冻结 >${LOAD_FREEZE}mA），连续 ${CONFIRM} 次确认，采样 ${INTERVAL}s"
+else
+	log "启动：区间 ${RESUME}~${CAP}%（仅百分比），连续 ${CONFIRM} 次确认，采样 ${INTERVAL}s"
+fi
 
-high_hits=0
-low_hits=0
+pending=-1        # 正在申请的切换目标（-1 = 无）
+pending_hits=0
 first_run=1
+frozen=0
 
 while :; do
-	# 模块被卸载 / 内核升级后参数节点消失，退出让 systemd 拉起（只记录一次）
+	# 模块被卸载 / 内核升级后参数节点消失，退出让 systemd 拉起
 	if [[ ! -w $CHG ]]; then
 		[[ -f $NO_MODULE ]] || {
 			log "smbx_ctl 模块消失，退出等待重启"
@@ -55,50 +72,76 @@ while :; do
 	fi
 
 	cap=$(cat "$BAT/capacity" 2>/dev/null)
-	if ! [[ ${cap:-} =~ ^[0-9]+$ ]]; then
-		log "读不到电量，重试"
+	uv=$(cat "$BAT/voltage_now" 2>/dev/null)
+	ua=$(cat "$BAT/current_now" 2>/dev/null)
+	ac=$(cat "$CHARGER/online" 2>/dev/null)
+
+	if ! [[ ${cap:-} =~ ^[0-9]+$ ]] || ! [[ ${uv:-} =~ ^[0-9]+$ ]]; then
+		log "读不到电量/电压，重试"
 		sleep "$INTERVAL"
 		continue
 	fi
-
-	# 连续命中计数：区间内清零，单次抖动不会触发切换
-	if (( cap >= CAP )); then
-		high_hits=$((high_hits + 1))
-		low_hits=0
-	elif (( cap <= RESUME )); then
-		low_hits=$((low_hits + 1))
-		high_hits=0
-	else
-		high_hits=0
-		low_hits=0
-	fi
-
-	cur=$(cat "$CHG" 2>/dev/null)
-	want=$cur
-	reason=hold
-
-	# 启动后的第一次采样直接按规则套用（不必等 CONFIRM 次），避免开机后
-	# 满电状态下白白多充一两分钟；之后才走连续确认
+	[[ ${ua:-} =~ ^-?[0-9]+$ ]] || ua=0
+	ima=$(( ua < 0 ? -ua / 1000 : ua / 1000 ))
 	need=$CONFIRM
 	(( first_run )) && need=1
 	first_run=0
 
+	cur=$(cat "$CHG" 2>/dev/null)
+	want=$cur
+	reason=
+
+	# ---- 判定 ----
 	if (( cap <= SAFETY )); then
-		want=1; reason="低于安全线 ${SAFETY}%，无条件充电"
-	elif (( high_hits >= need )); then
-		want=0; reason="到达上限 ${CAP}%，停止充电"
-	elif (( low_hits >= need )); then
-		want=1; reason="到达下限 ${RESUME}%，恢复充电"
+		want=1
+		reason="低于安全线 ${SAFETY}%"
+	elif (( ima > LOAD_FREEZE )); then
+		want=$cur
+		if (( ! frozen )); then
+			log "负载 ${ima}mA，暂停判定（保持 charging=$cur）"
+			frozen=1
+		fi
+	elif (( cur == 1 )); then
+		# 正在充电：只看该不该停
+		if (( cap >= CAP )); then
+			want=0; reason="电量 ${cap}% 到达上限 ${CAP}%"
+		elif (( VOLT_STOP > 0 && ac == 1 && uv >= VOLT_STOP )); then
+			want=0; reason="充电电压 $(volt "$uv")V 到达上限 $(volt "$VOLT_STOP")V"
+		fi
+	else
+		# 已停充：只看该不该恢复
+		if (( cap <= RESUME )); then
+			want=1; reason="电量 ${cap}% 到达下限 ${RESUME}%"
+		elif (( VOLT_RESUME > 0 && ac == 1 && ima <= LOAD_QUIET && uv <= VOLT_RESUME )); then
+			want=1; reason="静置电压 $(volt "$uv")V 降到下限 $(volt "$VOLT_RESUME")V"
+		fi
 	fi
 
+	if (( ima <= LOAD_FREEZE )) && (( frozen )); then
+		log "负载回落到 ${ima}mA，恢复判定"
+		frozen=0
+	fi
+
+	# ---- 连续确认后执行 ----
 	if [[ $want != "$cur" ]]; then
-		if echo "$want" >"$CHG"; then
-			log "电量 ${cap}% → charging=$want（$reason）"
-			high_hits=0
-			low_hits=0
+		if [[ $want == "$pending" ]]; then
+			pending_hits=$((pending_hits + 1))
 		else
-			log "写 charging 失败"
+			pending=$want
+			pending_hits=1
 		fi
+		if (( pending_hits >= need )); then
+			if echo "$want" >"$CHG"; then
+				log "电量 ${cap}%、$(volt "$uv")V、${ima}mA → charging=$want（$reason）"
+			else
+				log "写 charging 失败"
+			fi
+			pending=-1
+			pending_hits=0
+		fi
+	else
+		pending=-1
+		pending_hits=0
 	fi
 
 	# ---- USB 输入兜底 ----
@@ -108,6 +151,7 @@ while :; do
 		rm -f "$DRAIN_FLAG"
 	fi
 
+	# ---- 放电模式超时兜底 ----
 	if [[ -f $DRAIN_FLAG ]]; then
 		age=$(( $(date +%s) - $(stat -c %Y "$DRAIN_FLAG" 2>/dev/null || echo 0) ))
 		if (( age > DRAIN_MAX_AGE )); then
