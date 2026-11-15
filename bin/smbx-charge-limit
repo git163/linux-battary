@@ -19,11 +19,30 @@ DRAIN_MAX_AGE=${DRAIN_MAX_AGE:-43200}   # 放电模式最长 12h，超时强制�
 
 log() { logger -t smbx-charge-limit -- "$*"; echo "$(date '+%F %T') $*"; }
 
-[ -w "$CHG" ] && [ -w "$USB" ] || { log "smbx_ctl 模块未加载，退出"; exit 1; }
+# 模块不在（多半是内核升级后没重编）：只报一次，避免 systemd 反复重启刷日志
+NO_MODULE=/run/smbx-charge-limit.no-module
+if [[ ! -w $CHG || ! -w $USB ]]; then
+	if [[ ! -f $NO_MODULE ]]; then
+		log "smbx_ctl 模块未加载，暂停工作。重编后 systemctl restart smbx-charge-limit"
+		log "  重建: sudo /opt/smbx-ctl/build.sh（或仓库里的 module/build.sh）"
+		touch "$NO_MODULE"
+	fi
+	exit 1
+fi
+rm -f "$NO_MODULE"
 
 log "启动：上限 ${CAP}%，下限 ${RESUME}%，安全线 ${SAFETY}%，采样 ${INTERVAL}s"
 
 while :; do
+	# 模块被卸载 / 内核升级后参数节点消失，直接退出让 systemd 拉起（由上面的去重逻辑记录一次）
+	if [[ ! -w $CHG ]]; then
+		[[ -f $NO_MODULE ]] || {
+			log "smbx_ctl 模块消失，退出等待重启"
+			touch "$NO_MODULE"
+		}
+		exit 1
+	fi
+
 	cap=$(cat "$BAT/capacity" 2>/dev/null)
 
 	if ! [[ ${cap:-} =~ ^[0-9]+$ ]]; then

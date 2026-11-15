@@ -1,13 +1,15 @@
 [Unit]
 Description=Keep Redmi K20 Pro battery between 76% and 80%
+# 模块由 /etc/modules-load.d/smbx_ctl.conf 在开机时加载，必须排在它之后
 After=systemd-modules-load.service
 Wants=systemd-modules-load.service
 
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/smbx-charge-limit
+# 模块缺失（内核升级后）会退出并被反复拉起：1 分钟一次足够，别刷爆 journal
 Restart=always
-RestartSec=15
+RestartSec=60
 Nice=10
 
 [Install]
