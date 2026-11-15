@@ -3,7 +3,8 @@ Description=Discharge battery down to the 80% charge limit (one-shot)
 After=smbx-charge-limit.service
 
 [Service]
-Type=oneshot
+# Type=simple 而不是 oneshot：start 立刻返回，放电在后台跑；
+# stop 发 SIGTERM，脚本的 trap 会恢复 USB 输入并清掉放电标记
+Type=simple
 ExecStart=/usr/local/sbin/smbx-drain
-TimeoutStartSec=12h
-RemainAfterExit=no
+TimeoutStopSec=20
