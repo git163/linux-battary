@@ -1,0 +1,6 @@
+[Unit]
+Description=Sample battery state into /var/log/smbx-battery.csv
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/smbx-battery-log

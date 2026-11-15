@@ -1,0 +1,9 @@
+[Unit]
+Description=Discharge battery down to the 80% charge limit (one-shot)
+After=smbx-charge-limit.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/smbx-drain
+TimeoutStartSec=12h
+RemainAfterExit=no

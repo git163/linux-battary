@@ -1,0 +1,76 @@
+#!/bin/bash
+# smbx-battery-report —— 回看电量变化
+#   smbx-battery-report        最近 24 小时
+#   smbx-battery-report 72     最近 72 小时
+#   smbx-battery-report 0      全部
+set -u
+
+LOG=${LOG:-/var/log/smbx-battery.csv}
+HOURS=${1:-24}
+
+if ! [[ $HOURS =~ ^[0-9]+$ ]]; then
+	echo "用法: smbx-battery-report [小时数，默认 24；0 = 全部]" >&2
+	exit 1
+fi
+
+if [[ ! -r $LOG ]]; then
+	echo "还没有日志 $LOG —— smbx-battery-log.timer 跑过一次之后才会有" >&2
+	exit 1
+fi
+
+total=$(( $(wc -l <"$LOG") - 1 ))
+if (( total <= 0 )); then
+	echo "日志里还没有样本（等 5 分钟让定时器采一次）"
+	exit 0
+fi
+
+if (( HOURS == 0 )); then
+	cut="0000-00-00 00:00:00"
+	label="全部"
+else
+	cut=$(date -d "-$HOURS hours" '+%F %T')
+	label="最近 ${HOURS} 小时"
+fi
+
+echo "== 电池日志 $LOG =="
+echo "样本 $total 条  最早 $(sed -n 2p "$LOG" | cut -d, -f1)  最新 $(tail -1 "$LOG" | cut -d, -f1)"
+
+awk -F, -v cut="$cut" 'NR>1 && $1>=cut {n++} END{if(n) printf "本区间 %d 条\n", n}' "$LOG"
+
+echo
+echo "== 最新一条 =="
+tail -1 "$LOG" | awk -F, '{printf "  %s   %s%%   %s   电流 %s mA   电压 %s V   AC在线 %s   充电使能 %s   USB输入 %s\n", $1, $2, $3, $4, $5, $6, $7, $8}'
+
+echo
+echo "== ${label}：每小时 电量 最低/最高/平均 =="
+if ! awk -F, -v cut="$cut" '
+NR>1 && $1>=cut {
+	h = substr($1,1,13)
+	if (!(h in cnt)) { order[++n] = h }
+	cnt[h]++
+	if (cnt[h]==1 || $2<mn[h]) mn[h]=$2
+	if ($2>mx[h]) mx[h]=$2
+	sum[h]+=$2
+}
+END {
+	if (!n) { print "  （该区间没有样本）"; exit }
+	for (i=1; i<=n; i++) {
+		h=order[i]; avg=sum[h]/cnt[h]
+		bar=""; k=int(avg/5); for(j=0;j<k;j++) bar=bar "#"
+		printf "  %s   %3d ~ %3d  平均 %5.1f  %4d条  %s\n", h, mn[h], mx[h], avg, cnt[h], bar
+	}
+}' "$LOG"; then
+	echo "  （该区间没有样本）"
+fi
+
+echo
+echo "== 充放电状态变化（最近 20 次）=="
+awk -F, 'NR>1 {
+	if ($7 != p7 || $3 != p3 || $6 != p6) {
+		printf "  %s   %3d%%   %-14s charging=%s  usb_in=%s  ac=%s\n", $1, $2, $3, $7, $8, $6
+	}
+	p7=$7; p3=$3; p6=$6
+}' "$LOG" | tail -20
+
+echo
+echo "提示：服务启停 / 阈值动作明细看 journalctl -u smbx-charge-limit -n 50 --no-pager"

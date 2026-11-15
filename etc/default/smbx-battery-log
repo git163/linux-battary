@@ -1,0 +1,6 @@
+# 电量历史日志开关（由 smbx-battery-log-toggle 修改）
+# ENABLED=0 时采样脚本直接退出，不写任何数据；timer 也会被停掉
+ENABLED=1
+# 可选：换日志路径 / 滚动阈值（默认 /var/log/smbx-battery.csv，3MB）
+# LOG_FILE=/var/log/smbx-battery.csv
+# MAX_BYTES=3000000

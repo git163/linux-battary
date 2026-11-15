@@ -1,0 +1,72 @@
+#!/bin/bash
+# smbx-battery-log-toggle —— 电量历史日志的总开关
+#   smbx-battery-log-toggle on      开启（写 ENABLED=1 并启动 timer）
+#   smbx-battery-log-toggle off     关闭（写 ENABLED=0 并停掉 timer，日志文件保留）
+#   smbx-battery-log-toggle status  看当前状态与最近一条样本
+set -u
+
+CONF=/etc/default/smbx-battery-log
+LOG=/var/log/smbx-battery.csv
+TIMER=smbx-battery-log.timer
+
+usage() {
+	echo "用法: smbx-battery-log-toggle {on|off|status}" >&2
+	exit 1
+}
+
+need_root() {
+	[[ $EUID == 0 ]] || {
+		echo "需要 root：sudo smbx-battery-log-toggle $*" >&2
+		exit 1
+	}
+}
+
+write_conf() {
+	local val=$1
+	cat >"$CONF" <<EOF
+# 电量历史日志开关（由 smbx-battery-log-toggle 修改）
+# ENABLED=0 时采样脚本直接退出，不写任何数据；timer 也会被停掉
+ENABLED=$val
+# 可选：换日志路径 / 滚动阈值（默认 /var/log/smbx-battery.csv，3MB）
+# LOG_FILE=/var/log/smbx-battery.csv
+# MAX_BYTES=3000000
+EOF
+	chmod 0644 "$CONF"
+}
+
+show_status() {
+	local enabled="未知"
+	[[ -r $CONF ]] && enabled=$(grep -E '^ENABLED=' "$CONF" | cut -d= -f2)
+	echo "配置        : $CONF  ENABLED=${enabled}"
+	echo "timer 状态  : $(systemctl is-enabled "$TIMER" 2>/dev/null) / $(systemctl is-active "$TIMER" 2>/dev/null)"
+	if [[ -f $LOG ]]; then
+		echo "日志文件    : $LOG  ($(wc -l <"$LOG") 行, $(du -h "$LOG" | cut -f1))"
+		echo "最近一条    : $(tail -1 "$LOG")"
+	else
+		echo "日志文件    : 还没有（等下一次采样）"
+	fi
+}
+
+case ${1:-} in
+on)
+	need_root on
+	write_conf 1
+	systemctl enable --now "$TIMER"
+	systemctl start smbx-battery-log.service
+	echo "已开启电量日志，采样间隔 5 分钟；立即采一条 ↓"
+	tail -1 "$LOG" 2>/dev/null || echo "（首条样本稍后写入）"
+	;;
+off)
+	need_root off
+	write_conf 0
+	systemctl stop "$TIMER"
+	echo "已关闭电量日志（timer 已停，数据不再写入；历史文件保留在 $LOG）"
+	echo "重新开启: sudo smbx-battery-log-toggle on"
+	;;
+status)
+	show_status
+	;;
+*)
+	usage
+	;;
+esac

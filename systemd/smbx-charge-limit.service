@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep Redmi K20 Pro battery between 76% and 80%
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/smbx-charge-limit
+Restart=always
+RestartSec=15
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

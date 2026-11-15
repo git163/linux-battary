@@ -1,0 +1,58 @@
+#!/bin/bash
+# smbx-battery-log —— 采样一次电池状态，追加到 /var/log/smbx-battery.csv
+# 由 smbx-battery-log.timer 每 5 分钟触发；文件超过 3MB 滚动为 .1（约能存半年）
+set -u
+
+LOG=${LOG:-/var/log/smbx-battery.csv}
+BAT=/sys/class/power_supply/qcom-battery
+CHARGER=/sys/class/power_supply/pm8150b-charger
+PARAM=/sys/module/smbx_ctl/parameters
+MAXBYTES=${MAXBYTES:-3000000}
+HEADER="time,capacity,status,current_mA,voltage_V,ac_online,charging_enabled,usb_input"
+
+# 总开关：/etc/default/smbx-battery-log 里 ENABLED=0 就完全不写盘
+# （用 smbx-battery-log-toggle off 修改，比直接停 timer 更好恢复）
+CONF=${CONF:-/etc/default/smbx-battery-log}
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+[[ ${ENABLED:-1} == 1 ]] || exit 0
+
+LOG=${LOG_FILE:-$LOG}
+MAXBYTES=${MAX_BYTES:-$MAXBYTES}
+
+cap=$(cat "$BAT/capacity" 2>/dev/null) || exit 0
+[[ $cap =~ ^[0-9]+$ ]] || exit 0
+
+status=$(cat "$BAT/status" 2>/dev/null || echo unknown)
+online=$(cat "$CHARGER/online" 2>/dev/null || echo "?")
+chg=$(cat "$PARAM/charging" 2>/dev/null || echo "?")
+usb=$(cat "$PARAM/usb_input" 2>/dev/null || echo "?")
+
+# 电流/电压抖动很大（FG 采样有毛刺），7 次取中位数
+cur_vals=()
+vol_vals=()
+for _ in 1 2 3 4 5 6 7; do
+	c=$(cat "$BAT/current_now" 2>/dev/null || echo 0)
+	v=$(cat "$BAT/voltage_now" 2>/dev/null || echo 0)
+	[[ $c =~ ^-?[0-9]+$ ]] || c=0
+	[[ $v =~ ^[0-9]+$ ]] || v=0
+	cur_vals+=("$c")
+	vol_vals+=("$v")
+	sleep 0.3
+done
+cur=$(printf '%s\n' "${cur_vals[@]}" | sort -n | sed -n 4p)
+vol=$(printf '%s\n' "${vol_vals[@]}" | sort -n | sed -n 4p)
+
+# µA → mA，µV → V（三位小数）
+ma=$(( cur / 1000 ))
+vstr=$(printf '%d.%03d' $((vol / 1000000)) $(((vol % 1000000) / 1000)))
+
+# 先判断滚动，再决定要不要重新写表头
+if [[ -f $LOG && $(stat -c %s "$LOG") -gt $MAXBYTES ]]; then
+	mv -f "$LOG" "$LOG.1"
+fi
+[[ -f $LOG ]] || echo "$HEADER" >"$LOG"
+
+printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+	"$(date '+%F %T')" "$cap" "$status" "$ma" "$vstr" \
+	"$online" "$chg" "$usb" >>"$LOG"

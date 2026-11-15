@@ -1,0 +1,51 @@
+#!/bin/bash
+# smbx-drain —— 一次性把电量放到 CAP%（默认 80%），然后恢复 USB 供电并停止充电。
+# 放电机理：暂停 USB 输入，让手机靠电池运行。
+# 全程有兜底：smbx-charge-limit 会在电量 <= RESUME 或放电超时后恢复 USB 输入。
+set -u
+
+PARAM_DIR=/sys/module/smbx_ctl/parameters
+CHG=$PARAM_DIR/charging
+USB=$PARAM_DIR/usb_input
+BAT=/sys/class/power_supply/qcom-battery
+DRAIN_FLAG=/run/smbx-drain.active
+CAP=${CAP:-80}
+
+log() { logger -t smbx-drain -- "$*"; echo "$(date '+%F %T') $*"; }
+
+[ -w "$CHG" ] && [ -w "$USB" ] || { log "smbx_ctl 模块未加载，退出"; exit 1; }
+
+cap=$(cat "$BAT/capacity")
+if (( cap <= CAP )); then
+	log "当前 ${cap}% 已经不高于 ${CAP}%，无需放电"
+	exit 0
+fi
+
+# 无论怎么退出（含 systemctl stop / 被杀），都恢复 USB 输入
+cleanup() {
+	echo 1 >"$USB" 2>/dev/null
+	rm -f "$DRAIN_FLAG"
+}
+trap cleanup EXIT INT TERM
+
+log "开始放电：${cap}% → ${CAP}%（期间手机靠电池供电，WiFi/SSH 不受影响）"
+touch "$DRAIN_FLAG"
+echo 0 >"$CHG"
+echo 0 >"$USB"
+
+while :; do
+	cap=$(cat "$BAT/capacity")
+	if (( cap <= CAP )); then
+		break
+	fi
+	if (( cap <= 30 )); then
+		log "电量 ${cap}% 异常偏低，中止放电"
+		break
+	fi
+	sleep 60
+done
+
+echo 1 >"$USB"
+echo 0 >"$CHG"
+rm -f "$DRAIN_FLAG"
+log "放电结束：电量 ${cap}%，已恢复 USB 供电并保持停止充电"

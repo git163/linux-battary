@@ -1,0 +1,73 @@
+#!/bin/bash
+# smbx-charge-limit —— 把电池电量控制在 76%~80% 之间
+#   达到 CAP 就停止充电；掉到 RESUME 再放开充电；低于 SAFETY 无条件充电。
+#   若 /run/smbx-drain.active 存在且未超时，仅做兜底，不干预 USB 输入。
+set -u
+
+PARAM_DIR=/sys/module/smbx_ctl/parameters
+CHG=$PARAM_DIR/charging
+USB=$PARAM_DIR/usb_input
+BAT=/sys/class/power_supply/qcom-battery
+CHARGER=/sys/class/power_supply/pm8150b-charger
+DRAIN_FLAG=/run/smbx-drain.active
+
+CAP=${CAP:-80}          # 上限：到这里停止充电
+RESUME=${RESUME:-76}    # 下限：掉到这里恢复充电
+SAFETY=${SAFETY:-40}    # 安全线：低于此值无条件充电
+INTERVAL=${INTERVAL:-60}
+DRAIN_MAX_AGE=${DRAIN_MAX_AGE:-43200}   # 放电模式最长 12h，超时强制恢复
+
+log() { logger -t smbx-charge-limit -- "$*"; echo "$(date '+%F %T') $*"; }
+
+[ -w "$CHG" ] && [ -w "$USB" ] || { log "smbx_ctl 模块未加载，退出"; exit 1; }
+
+log "启动：上限 ${CAP}%，下限 ${RESUME}%，安全线 ${SAFETY}%，采样 ${INTERVAL}s"
+
+while :; do
+	cap=$(cat "$BAT/capacity" 2>/dev/null)
+
+	if ! [[ ${cap:-} =~ ^[0-9]+$ ]]; then
+		log "读不到电量，重试"
+		sleep "$INTERVAL"
+		continue
+	fi
+
+	# ---- 充电开关（滞回）----
+	cur=$(cat "$CHG" 2>/dev/null)
+	want=$cur
+	reason=hold
+
+	if (( cap <= SAFETY )); then
+		want=1; reason=safety
+	elif (( cap >= CAP )); then
+		want=0; reason=cap
+	elif (( cap <= RESUME )); then
+		want=1; reason=resume
+	fi
+
+	if [[ $want != "$cur" ]]; then
+		if echo "$want" >"$CHG"; then
+			log "电量 ${cap}% → charging=$want（$reason）"
+		else
+			log "写 charging 失败"
+		fi
+	fi
+
+	# ---- USB 输入兜底 ----
+	usb=$(cat "$USB" 2>/dev/null)
+	if (( cap <= RESUME )) && [[ $usb == 0 ]]; then
+		echo 1 >"$USB" && log "电量 ${cap}% → 恢复 USB 输入（兜底）"
+		rm -f "$DRAIN_FLAG"
+	fi
+
+	if [[ -f $DRAIN_FLAG ]]; then
+		age=$(( $(date +%s) - $(stat -c %Y "$DRAIN_FLAG" 2>/dev/null || echo 0) ))
+		if (( age > DRAIN_MAX_AGE )); then
+			rm -f "$DRAIN_FLAG"
+			echo 1 >"$USB"
+			log "放电模式超过 $((DRAIN_MAX_AGE / 3600))h，强制恢复 USB 输入"
+		fi
+	fi
+
+	sleep "$INTERVAL"
+done
