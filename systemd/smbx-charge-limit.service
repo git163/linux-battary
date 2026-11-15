@@ -6,7 +6,7 @@ Wants=systemd-modules-load.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/smbx-charge-limit
+ExecStart=/usr/local/bin/smbx-charge-limit
 # 模块缺失（内核升级后）会退出并被反复拉起：1 分钟一次足够，别刷爆 journal
 Restart=always
 RestartSec=60

@@ -76,8 +76,10 @@ show_status() {
 	fi
 
 	echo "== 模块 =="
-	if [[ -w $CHG ]]; then
-		printf '  smbx_ctl 已加载   charging=%s  usb_input=%s\n' "$charging" "$usb"
+	if [[ -e $CHG ]]; then
+		printf '  smbx_ctl 已加载   charging=%s  usb_input=%s' "$charging" "$usb"
+		[[ -w $CHG ]] || printf '（只读，改动需要 sudo）'
+		echo
 	else
 		echo "  smbx_ctl 未加载 —— 内核升级后需要重编：sudo /opt/smbx-ctl/build.sh"
 	fi

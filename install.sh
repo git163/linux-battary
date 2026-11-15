@@ -19,10 +19,10 @@ for cand in "$ROOT/module" "$ROOT/../battery/module"; do
 done
 [[ -n $MODULE_DIR ]] || { echo "找不到内核模块源码（module/smbx_ctl.c）" >&2; exit 1; }
 
-echo "== 1/5 安装命令行工具到 /usr/local/sbin =="
+echo "== 1/5 安装命令行工具到 /usr/local/bin =="
 for f in smbx smbx-charge-limit smbx-drain smbx-battery-log smbx-battery-report smbx-battery-log-toggle; do
-	install -m 0755 "$ROOT/bin/$f" "/usr/local/sbin/$f"
-	echo "  /usr/local/sbin/$f"
+	install -m 0755 "$ROOT/bin/$f" "/usr/local/bin/$f"
+	echo "  /usr/local/bin/$f"
 done
 
 echo "== 2/5 安装 systemd 单元 =="

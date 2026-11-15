@@ -19,7 +19,7 @@ software/
 │   ├── modules-load.d/smbx_ctl.conf   开机加载模块
 │   ├── default/smbx-charge-limit      区间配置（CAP/RESUME/CONFIRM/SAFETY/INTERVAL）
 │   └── default/smbx-battery-log       日志开关（ENABLED）
-└── install.sh                  装到 /usr/local/sbin、/etc/systemd/system、/etc/default
+└── install.sh                  装到 /usr/local/bin、/etc/systemd/system、/etc/default
 ```
 
 ## 安装

@@ -6,5 +6,5 @@ After=smbx-charge-limit.service
 # Type=simple 而不是 oneshot：start 立刻返回，放电在后台跑；
 # stop 发 SIGTERM，脚本的 trap 会恢复 USB 输入并清掉放电标记
 Type=simple
-ExecStart=/usr/local/sbin/smbx-drain
+ExecStart=/usr/local/bin/smbx-drain
 TimeoutStopSec=20
