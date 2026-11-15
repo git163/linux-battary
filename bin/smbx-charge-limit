@@ -1,6 +1,8 @@
 #!/bin/bash
-# smbx-charge-limit —— 把电池电量控制在 76%~80% 之间
-#   达到 CAP 就停止充电；掉到 RESUME 再放开充电；低于 SAFETY 无条件充电。
+# smbx-charge-limit —— 把电池电量控制在 RESUME%~CAP% 之间（默认 75~80%）
+#   到 CAP 停充；掉到 RESUME 再放开；区间内不动（死区）；
+#   且需连续 CONFIRM 次采样满足条件才切换，避免在阈值附近来回断电/充电。
+#   低于 SAFETY 无条件充电（不等待确认）。
 #   若 /run/smbx-drain.active 存在且未超时，仅做兜底，不干预 USB 输入。
 set -u
 
@@ -10,11 +12,16 @@ USB=$PARAM_DIR/usb_input
 BAT=/sys/class/power_supply/qcom-battery
 CHARGER=/sys/class/power_supply/pm8150b-charger
 DRAIN_FLAG=/run/smbx-drain.active
+CONF=${CONF:-/etc/default/smbx-charge-limit}
+
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
 
 CAP=${CAP:-80}          # 上限：到这里停止充电
-RESUME=${RESUME:-76}    # 下限：掉到这里恢复充电
+RESUME=${RESUME:-75}    # 下限：掉到这里恢复充电
 SAFETY=${SAFETY:-40}    # 安全线：低于此值无条件充电
 INTERVAL=${INTERVAL:-60}
+CONFIRM=${CONFIRM:-2}   # 连续多少次采样满足条件才切换
 DRAIN_MAX_AGE=${DRAIN_MAX_AGE:-43200}   # 放电模式最长 12h，超时强制恢复
 
 log() { logger -t smbx-charge-limit -- "$*"; echo "$(date '+%F %T') $*"; }
@@ -31,10 +38,14 @@ if [[ ! -w $CHG || ! -w $USB ]]; then
 fi
 rm -f "$NO_MODULE"
 
-log "启动：上限 ${CAP}%，下限 ${RESUME}%，安全线 ${SAFETY}%，采样 ${INTERVAL}s"
+log "启动：区间 ${RESUME}~${CAP}%（死区，连续 ${CONFIRM} 次确认才切换），安全线 ${SAFETY}%，采样 ${INTERVAL}s"
+
+high_hits=0
+low_hits=0
+first_run=1
 
 while :; do
-	# 模块被卸载 / 内核升级后参数节点消失，直接退出让 systemd 拉起（由上面的去重逻辑记录一次）
+	# 模块被卸载 / 内核升级后参数节点消失，退出让 systemd 拉起（只记录一次）
 	if [[ ! -w $CHG ]]; then
 		[[ -f $NO_MODULE ]] || {
 			log "smbx_ctl 模块消失，退出等待重启"
@@ -44,29 +55,47 @@ while :; do
 	fi
 
 	cap=$(cat "$BAT/capacity" 2>/dev/null)
-
 	if ! [[ ${cap:-} =~ ^[0-9]+$ ]]; then
 		log "读不到电量，重试"
 		sleep "$INTERVAL"
 		continue
 	fi
 
-	# ---- 充电开关（滞回）----
+	# 连续命中计数：区间内清零，单次抖动不会触发切换
+	if (( cap >= CAP )); then
+		high_hits=$((high_hits + 1))
+		low_hits=0
+	elif (( cap <= RESUME )); then
+		low_hits=$((low_hits + 1))
+		high_hits=0
+	else
+		high_hits=0
+		low_hits=0
+	fi
+
 	cur=$(cat "$CHG" 2>/dev/null)
 	want=$cur
 	reason=hold
 
+	# 启动后的第一次采样直接按规则套用（不必等 CONFIRM 次），避免开机后
+	# 满电状态下白白多充一两分钟；之后才走连续确认
+	need=$CONFIRM
+	(( first_run )) && need=1
+	first_run=0
+
 	if (( cap <= SAFETY )); then
-		want=1; reason=safety
-	elif (( cap >= CAP )); then
-		want=0; reason=cap
-	elif (( cap <= RESUME )); then
-		want=1; reason=resume
+		want=1; reason="低于安全线 ${SAFETY}%，无条件充电"
+	elif (( high_hits >= need )); then
+		want=0; reason="到达上限 ${CAP}%，停止充电"
+	elif (( low_hits >= need )); then
+		want=1; reason="到达下限 ${RESUME}%，恢复充电"
 	fi
 
 	if [[ $want != "$cur" ]]; then
 		if echo "$want" >"$CHG"; then
 			log "电量 ${cap}% → charging=$want（$reason）"
+			high_hits=0
+			low_hits=0
 		else
 			log "写 charging 失败"
 		fi

@@ -26,12 +26,15 @@ done
 
 echo "== 3/5 安装配置 =="
 install -m 0644 "$ROOT/etc/modules-load.d/smbx_ctl.conf" /etc/modules-load.d/smbx_ctl.conf
-if [[ -f /etc/default/smbx-battery-log ]]; then
-	echo "  /etc/default/smbx-battery-log 已存在，保留原设置"
-else
-	install -m 0644 "$ROOT/etc/default/smbx-battery-log" /etc/default/smbx-battery-log
-	echo "  /etc/default/smbx-battery-log（默认 ENABLED=1）"
-fi
+for conf in smbx-battery-log:日志开关 smbx-charge-limit:电量区间; do
+	name=${conf%%:*}; desc=${conf##*:}
+	if [[ -f /etc/default/$name ]]; then
+		echo "  /etc/default/$name 已存在（$desc），保留原设置"
+	else
+		install -m 0644 "$ROOT/etc/default/$name" "/etc/default/$name"
+		echo "  /etc/default/$name（$desc，默认值）"
+	fi
+done
 
 echo "== 4/5 编译并安装内核模块 =="
 if (( BUILD )); then

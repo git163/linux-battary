@@ -1,7 +1,7 @@
 # battery —— 把 K20 Pro 的充电封顶在 80%
 
 Redmi K20 Pro（`raphael`，Debian 13 + 内核 `7.3.0-rc5-sm8150`）长期插电当服务器时，
-用这一套把电池控制在 **76%~80%**，顺带记录电量曲线。
+用这一套把电池控制在 **75%~80%**，顺带记录电量曲线。
 
 ## 为什么不能直接写 sysfs
 
@@ -19,13 +19,13 @@ Redmi K20 Pro（`raphael`，Debian 13 + 内核 `7.3.0-rc5-sm8150`）长期插电
 | 文件 | 作用 |
 |---|---|
 | `module/smbx_ctl.c` | out-of-tree 内核模块，暴露两个 module param：`charging`、`usb_input` |
-| `bin/smbx-charge-limit` | 守护进程脚本：≥80% 停充 / ≤76% 恢复 / ≤40% 无条件充电 |
+| `bin/smbx-charge-limit` | 守护进程脚本：≥80% 停充 / ≤75% 恢复（75~80 死区 + 连续 2 次确认，不会来回切）/ ≤40% 无条件充电 |
 | `bin/smbx-drain` | 一次性放电到 80%（暂停 USB 输入，让手机靠电池跑） |
 | `bin/smbx-battery-log` | 每 5 分钟采样一次，写 CSV（7 次取中位数去毛刺） |
 | `bin/smbx-battery-report` | 回看电量曲线：每小时 最低/最高/平均 + 充放电状态变化 |
 | `bin/smbx-battery-log-toggle` | 电量日志总开关：`on` / `off` / `status` |
 | `systemd/` | `smbx-charge-limit.service`、`smbx-drain.service`、`smbx-battery-log.service/.timer` |
-| `etc/` | `modules-load.d/smbx_ctl.conf`（开机加载）、`default/smbx-battery-log`（日志开关） |
+| `etc/` | `modules-load.d/smbx_ctl.conf`（开机加载）、`default/smbx-battery-log`（日志开关）、`default/smbx-charge-limit`（电量区间） |
 
 ## 安装
 
@@ -47,6 +47,10 @@ echo 0 | sudo tee /sys/module/smbx_ctl/parameters/charging
 # 一次性放电到 80%（数小时，靠电池跑；stop 会立刻恢复 USB 供电）
 sudo systemctl start smbx-drain
 sudo systemctl stop smbx-drain
+
+# 改电量区间（默认 75~80，改完重启守护进程）
+sudo vi /etc/default/smbx-charge-limit     # CAP / RESUME / CONFIRM / SAFETY / INTERVAL
+sudo systemctl restart smbx-charge-limit
 
 # 电量历史
 smbx-battery-report          # 最近 24h
