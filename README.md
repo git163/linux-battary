@@ -1,93 +1,79 @@
-# battery —— 把 K20 Pro 的充电封顶在 80%
+# software —— 充电封顶 80% 的运行时软件
 
-Redmi K20 Pro（`raphael`，Debian 13 + 内核 `7.3.0-rc5-sm8150`）长期插电当服务器时，
-用这一套把电池控制在 **70%~80%**，顺带记录电量曲线。
+跑在 Redmi K20 Pro（`raphael` / Debian 13 / 内核 `7.3.0-rc5-sm8150`）上的守护脚本、
+systemd 单元和配置。底层靠 `../battery/module/` 的内核模块操作 PMIC。
 
-## 为什么不能直接写 sysfs
+## 结构
 
-| 想用的接口 | 实际情况 |
-|---|---|
-| `charge_control_end_threshold`（TLP / upower 用） | 内核里**没有**。驱动是 `qcom_smbx`（SMB5 / pm8150b），只暴露 9 个属性 |
-| `pm8150b-charger/current_max`（输入电流限制） | 可写（`USBIN_CURRENT_LIMIT_CFG` = base+0x370），但 AICL 会自动接管，实测对充电电流无稳定影响 |
-| `qcom-battery/constant_charge_current_max` | 只读 |
-
-真正管用的是 PMIC 的 **`CHARGING_ENABLE_CMD`**（`base + 0x42`，bit0），驱动只在 probe
-时写它，所以只能自己写个小模块去操作。
-
-## 组成
-
-| 文件 | 作用 |
-|---|---|
-| `module/smbx_ctl.c` | out-of-tree 内核模块，暴露两个 module param：`charging`、`usb_input` |
-| `bin/smbx-charge-limit` | 守护进程脚本：≥80% 停充 / ≤70% 恢复（70~80 死区 + 连续 2 次确认，不会来回切）/ ≤40% 无条件充电 |
-| `bin/smbx-drain` | 一次性放电到 80%（暂停 USB 输入，让手机靠电池跑） |
-| `bin/smbx-battery-log` | 每 5 分钟采样一次，写 CSV（7 次取中位数去毛刺） |
-| `bin/smbx-battery-report` | 回看电量曲线：每小时 最低/最高/平均 + 充放电状态变化 |
-| `bin/smbx-battery-log-toggle` | 电量日志总开关：`on` / `off` / `status` |
-| `systemd/` | `smbx-charge-limit.service`、`smbx-drain.service`、`smbx-battery-log.service/.timer` |
-| `etc/` | `modules-load.d/smbx_ctl.conf`（开机加载）、`default/smbx-battery-log`（日志开关）、`default/smbx-charge-limit`（电量区间） |
+```
+software/
+├── bin/
+│   ├── smbx                    ← 统一入口（status/charge/log/report/drain/restart）
+│   ├── smbx-charge-limit       ← 守护进程：区间滞回 + 连续确认
+│   ├── smbx-drain              ← 一次性放电到上限
+│   ├── smbx-battery-log        ← 5 分钟采样写 CSV
+│   ├── smbx-battery-report     ← 回看曲线
+│   └── smbx-battery-log-toggle ← 日志总开关
+├── systemd/                    4 个单元（charge-limit / drain / battery-log .service+.timer）
+├── etc/
+│   ├── modules-load.d/smbx_ctl.conf   开机加载模块
+│   ├── default/smbx-charge-limit      区间配置（CAP/RESUME/CONFIRM/SAFETY/INTERVAL）
+│   └── default/smbx-battery-log       日志开关（ENABLED）
+└── install.sh                  装到 /usr/local/sbin、/etc/systemd/system、/etc/default
+```
 
 ## 安装
 
 ```bash
-sudo ./install.sh          # 编译模块 + 装全部脚本/服务 + 启动
-sudo ./install.sh --no-build   # 用仓库里已有的 .ko
+sudo ./install.sh              # 编译模块 + 装脚本/服务 + 启动
+sudo ./install.sh --no-build   # 用已编好的 .ko
 ```
 
-> 仓库：<https://github.com/git163/linux-battary>
-> 这个仓库是 `k20pro` 工作区里 `battery/` 的镜像，内容是根目录直接可用的。
-> 从工作区同步：`./scripts/push-github.sh`（在 `k20pro/` 根目录执行）。
-
-## 常用操作
+## 常用命令
 
 ```bash
-# 手动开关充电（0 停 / 1 允许，读回是寄存器真实值）
-echo 0 | sudo tee /sys/module/smbx_ctl/parameters/charging
-
-# 一次性放电到 80%（数小时，靠电池跑；stop 会立刻恢复 USB 供电）
-sudo systemctl start smbx-drain
-sudo systemctl stop smbx-drain
-
-# 改电量区间（默认 70~80，改完重启守护进程）
-sudo vi /etc/default/smbx-charge-limit     # CAP / RESUME / CONFIRM / SAFETY / INTERVAL
-sudo systemctl restart smbx-charge-limit
-
-# 电量历史
-smbx-battery-report          # 最近 24h
-smbx-battery-report 72       # 最近 72h
-smbx-battery-report 0        # 全部
-
-# 关掉 / 打开电量日志（数据保留，只是不再写）
-sudo smbx-battery-log-toggle off
-sudo smbx-battery-log-toggle on
-smbx-battery-log-toggle status
-
-# 阈值动作明细
-journalctl -u smbx-charge-limit -n 50 --no-pager
+smbx status                       # 电量 / 策略 / 日志 / 模块，一屏看完
+smbx charge off                   # 手动停止充电（on 放开）
+smbx log off                      # 关掉电量日志（on 恢复，status 看状态）
+smbx report 24                    # 回看最近 24 小时电量曲线（0 = 全部）
+smbx drain start                  # 放电到上限（后台，靠电池跑；stop 中止）
+sudo smbx restart                 # 改完 /etc/default 后重启守护进程
 ```
 
-## 编译踩的坑
+## 策略
 
-内核是用 **Ubuntu clang 23.1.4**（`CONFIG_LTO_CLANG_THIN=y`）编的，Debian 仓库只有 clang-22，
-而 clang-23 才有的 `-fms-anonymous-structs` 参数 clang-22 不认，直接导致
-`static_assert(sizeof(struct filename) % 64 == 0)` 失败。
+| 条件 | 动作 |
+|---|---|
+| ≥ 80%（`CAP`），连续 2 次采样 | 停止充电 |
+| ≤ 70%（`RESUME`），连续 2 次采样 | 恢复充电 |
+| 70 ~ 80 之间 | 死区，不动 |
+| ≤ 40%（`SAFETY`） | 无条件充电 |
 
-`module/clang-wrap.sh` 就是个参数翻译层：把 `-fms-anonymous-structs` 换成 `-fms-extensions`
-（并补 `-Wno-microsoft-anon-tag`），再丢掉 `-fexperimental-late-parse-attributes` / `-fsplit-lto-unit`。
+改区间：`sudo vi /etc/default/smbx-charge-limit` 后 `sudo smbx restart`。
+
+## 电量日志
+
+`/var/log/smbx-battery.csv`，每 5 分钟一条，超 3MB 滚动成 `.1`：
+
+```
+time,capacity,status,current_mA,voltage_V,ac_online,charging_enabled,usb_input
+2026-11-15 12:15:41,99,Charging,0,4.332,1,0,1
+```
+
+负电流=放电、正=充电；电量计单次读数有毛刺，脚本取 7 次中位数再落盘。
+`smbx log off` 关掉后 timer 停、脚本也直接退出，历史文件保留。
 
 ## 内核升级之后
 
-模块会失效（`insmod` 报 version mismatch，或 daemon 起不来）：
+模块会失效（`journalctl -u smbx-charge-limit` 里出现「模块未加载」）：
 
 ```bash
-sudo ./module/build.sh     # 在仓库里重编
-# 或者设备上 /opt/smbx-ctl/build.sh
-systemctl restart smbx-charge-limit
+sudo ../battery/module/build.sh        # 重编（依赖 clang-22 + 内核头文件）
+sudo smbx restart
 ```
 
 ## 已知事实（实测）
 
-- `charging=0` 时手机**仍由 USB 供电**，电池只是歇着（电流 ≈0，电压稳定 4.33V），不会自己掉电。
-- `usb_input=0` 才是真的靠电池跑：`online` 变 0，放电电流 0.27~0.87A。
-- 电量计单次读数毛刺很大（见过 `-793mA / 4.139V` 的假值），所以采样取中位数。
-- 加载模块后内核会标 `tainted`，属正常。
+- `charging=0` 时手机**仍由 USB 供电**，电池只是歇着（电流 ≈0，电压 4.33V 稳定）。
+- 只有 `usb_input=0` 才是真的靠电池跑（放电 0.27~0.87A），放电脚本用的就是它。
+- 插着线却显示 `Discharging` 是正常的：USB 输入限流 250~500 mA，满载时电池补差额。

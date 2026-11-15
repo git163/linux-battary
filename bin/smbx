@@ -1,0 +1,143 @@
+#!/bin/bash
+# smbx —— 充电管理统一入口（K20 Pro 电池封顶 80%）
+#
+#   smbx status                 看电量 / 策略 / 日志 / 模块状态（默认命令）
+#   smbx charge on|off          手动放开 / 停止充电
+#   smbx log on|off|status      电量历史日志开关
+#   smbx report [小时数]        回看电量曲线（默认 24，0=全部）
+#   smbx drain start|stop|status 放电到上限（一次性）
+#   smbx restart                重启守护进程（改完 /etc/default 后用）
+set -u
+
+PARAM=/sys/module/smbx_ctl/parameters
+CHG=$PARAM/charging
+USB=$PARAM/usb_input
+BAT=/sys/class/power_supply/qcom-battery
+CHARGER=/sys/class/power_supply/pm8150b-charger
+CONF=/etc/default/smbx-charge-limit
+LOG_ENV=/etc/default/smbx-battery-log
+CSV=/var/log/smbx-battery.csv
+UNIT=smbx-charge-limit
+TIMER=smbx-battery-log.timer
+
+need_root() {
+	[[ $EUID == 0 ]] || {
+		echo "需要 root：sudo smbx $*" >&2
+		exit 1
+	}
+}
+
+conf_var() { # conf_var 文件 变量名 默认值
+	( # shellcheck source=/dev/null
+		[[ -r $1 ]] && . "$1"
+		eval "echo \${$2:-$3}"
+	)
+}
+
+show_status() {
+	local cap cur vol ac charging usb cap_max cap_resume confirm interval
+	cap=$(cat "$BAT/capacity" 2>/dev/null || echo "?")
+	vol=$(cat "$BAT/voltage_now" 2>/dev/null || echo 0)
+	cur=$(cat "$BAT/current_now" 2>/dev/null || echo 0)
+	ac=$(cat "$CHARGER/online" 2>/dev/null || echo "?")
+	charging=$(cat "$CHG" 2>/dev/null || echo "-")
+	usb=$(cat "$USB" 2>/dev/null || echo "-")
+
+	cap_max=$(conf_var "$CONF" CAP 80)
+	cap_resume=$(conf_var "$CONF" RESUME 70)
+	confirm=$(conf_var "$CONF" CONFIRM 2)
+	interval=$(conf_var "$CONF" INTERVAL 60)
+
+	local vstr cstr state
+	vstr=$(printf '%d.%03d' $((vol / 1000000)) $(((vol % 1000000) / 1000)))
+	cstr=$(awk -v c="$cur" 'BEGIN{printf "%.1f", c/1000}')
+	if [[ $charging == 0 ]]; then state="停充（封顶）"; elif [[ $charging == 1 ]]; then state="允许充电"; else state="模块未加载"; fi
+
+	echo "== 电量 =="
+	printf '  %s%%   %s V   %s mA   %s   %s\n' "$cap" "$vstr" "$cstr" \
+		"$([[ $ac == 1 ]] && echo 'USB 在线' || echo '未插电')" "$state"
+
+	echo "== 策略 =="
+	printf '  区间 %s~%s%%，连续 %s 次确认，采样 %ss   %s\n' \
+		"$cap_resume" "$cap_max" "$confirm" "$interval" \
+		"$(systemctl is-active $UNIT 2>/dev/null)"
+
+	echo "== 日志 =="
+	local enabled file lines
+	enabled=$(conf_var "$LOG_ENV" ENABLED 1)
+	if [[ -f $CSV ]]; then
+		lines=$(( $(wc -l <"$CSV") - 1 ))
+		printf '  ENABLED=%s   timer %s   %s 条   最近 %s\n' "$enabled" \
+			"$(systemctl is-active $TIMER 2>/dev/null)" "$lines" \
+			"$(tail -1 "$CSV" | cut -d, -f1)"
+	else
+		printf '  ENABLED=%s   timer %s   还没有数据\n' "$enabled" \
+			"$(systemctl is-active $TIMER 2>/dev/null)"
+	fi
+
+	echo "== 模块 =="
+	if [[ -w $CHG ]]; then
+		printf '  smbx_ctl 已加载   charging=%s  usb_input=%s\n' "$charging" "$usb"
+	else
+		echo "  smbx_ctl 未加载 —— 内核升级后需要重编：sudo /opt/smbx-ctl/build.sh"
+	fi
+}
+
+cmd_charge() {
+	case ${1:-} in
+	on) need_root charge on; echo 1 >"$CHG" && echo "已放开充电" ;;
+	off) need_root charge off; echo 0 >"$CHG" && echo "已停止充电" ;;
+	status) show_status ;;
+	*) echo "用法: smbx charge on|off" >&2; exit 1 ;;
+	esac
+}
+
+cmd_log() {
+	case ${1:-} in
+	on | off | status) need_root log "$1"; exec smbx-battery-log-toggle "$1" ;;
+	*) echo "用法: smbx log on|off|status" >&2; exit 1 ;;
+	esac
+}
+
+cmd_drain() {
+	case ${1:-status} in
+	start)
+		need_root drain start
+		echo "开始放电到上限（后台跑，靠电池供电；随时 smbx drain stop 中止）"
+		systemctl start smbx-drain.service
+		;;
+	stop)
+		need_root drain stop
+		systemctl stop smbx-drain.service
+		echo "已中止放电，USB 供电已恢复"
+		;;
+	status)
+		if systemctl is-active --quiet smbx-drain.service; then
+			printf '放电中：当前 %s%%（目标 ≤ %s%%）\n' \
+				"$(cat "$BAT/capacity")" "$(conf_var "$CONF" CAP 80)"
+		else
+			echo "未在放电"
+		fi
+		;;
+	*) echo "用法: smbx drain start|stop|status" >&2; exit 1 ;;
+	esac
+}
+
+case ${1:-status} in
+status) show_status ;;
+charge) shift; cmd_charge "$@" ;;
+log) shift; cmd_log "$@" ;;
+report) shift; exec smbx-battery-report "${1:-24}" ;;
+drain) shift; cmd_drain "$@" ;;
+restart)
+	need_root restart
+	systemctl restart "$UNIT" && sleep 2 && journalctl -u "$UNIT" -n 3 --no-pager -o cat
+	;;
+help | -h | --help)
+	awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"
+	;;
+*)
+	echo "未知命令: $1（试试 smbx help）" >&2
+	exit 1
+	;;
+esac

@@ -1,9 +1,9 @@
 #!/bin/bash
-# install.sh —— 把 battery/ 这整套东西装到本机（Redmi K20 Pro / Debian 13）
-#   sudo ./install.sh            编译模块 + 装脚本/服务 + 启动守护进程
-#   sudo ./install.sh --no-build 跳过模块编译（直接用已编好的 .ko）
+# install.sh —— 装运行时软件（脚本 + systemd 单元 + 配置）并编译内核模块
+#   sudo ./install.sh             编译模块 + 装全部脚本/服务 + 启动
+#   sudo ./install.sh --no-build  跳过编译，直接用已编好的 .ko
 #
-# 已存在的 /etc/default/smbx-battery-log 不会被覆盖（保住你日志开关的设置）。
+# 已存在的 /etc/default/smbx-* 不会被覆盖（保住你的区间与日志开关设置）。
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
@@ -12,8 +12,15 @@ ROOT=$(cd "$(dirname "$0")" && pwd)
 BUILD=1
 [[ ${1:-} == --no-build ]] && BUILD=0
 
+# 内核模块目录：本地仓库是 ../battery/module，单独分发时是 ./module
+MODULE_DIR=
+for cand in "$ROOT/module" "$ROOT/../battery/module"; do
+	[[ -f $cand/smbx_ctl.c ]] && { MODULE_DIR=$(cd "$cand" && pwd); break; }
+done
+[[ -n $MODULE_DIR ]] || { echo "找不到内核模块源码（module/smbx_ctl.c）" >&2; exit 1; }
+
 echo "== 1/5 安装命令行工具到 /usr/local/sbin =="
-for f in smbx-charge-limit smbx-drain smbx-battery-log smbx-battery-report smbx-battery-log-toggle; do
+for f in smbx smbx-charge-limit smbx-drain smbx-battery-log smbx-battery-report smbx-battery-log-toggle; do
 	install -m 0755 "$ROOT/bin/$f" "/usr/local/sbin/$f"
 	echo "  /usr/local/sbin/$f"
 done
@@ -38,9 +45,9 @@ done
 
 echo "== 4/5 编译并安装内核模块 =="
 if (( BUILD )); then
-	"$ROOT/module/build.sh"
+	"$MODULE_DIR/build.sh"
 else
-	install -D -m 0644 "$ROOT/module/smbx_ctl.ko" "/lib/modules/$(uname -r)/extra/smbx_ctl.ko"
+	install -D -m 0644 "$MODULE_DIR/smbx_ctl.ko" "/lib/modules/$(uname -r)/extra/smbx_ctl.ko"
 	depmod -a "$(uname -r)"
 	echo "  已安装预编译的 smbx_ctl.ko"
 fi
@@ -54,7 +61,7 @@ systemctl enable --now smbx-battery-log.timer
 systemctl start smbx-battery-log.service || true
 systemctl --no-pager --lines=0 status smbx-charge-limit.service | head -3
 echo
-echo "安装完成。"
-echo "  状态: smbx-battery-log-toggle status"
-echo "  回看: smbx-battery-report"
-echo "  日志: journalctl -u smbx-charge-limit -f"
+echo "安装完成。常用命令："
+echo "  smbx status           # 电量 / 策略 / 日志 / 模块"
+echo "  smbx report 24        # 回看电量曲线"
+echo "  smbx help             # 全部命令"
