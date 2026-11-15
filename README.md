@@ -34,6 +34,10 @@ sudo ./install.sh          # 编译模块 + 装全部脚本/服务 + 启动
 sudo ./install.sh --no-build   # 用仓库里已有的 .ko
 ```
 
+> 仓库：<https://github.com/git163/linux-battary>
+> 这个仓库是 `k20pro` 工作区里 `battery/` 的镜像，内容是根目录直接可用的。
+> 从工作区同步：`./scripts/push-github.sh`（在 `k20pro/` 根目录执行）。
+
 ## 常用操作
 
 ```bash
