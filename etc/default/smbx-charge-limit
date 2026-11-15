@@ -1,7 +1,7 @@
 # 电量区间与采样（smbx-charge-limit 读取；改完 systemctl restart smbx-charge-limit）
 # 死区：RESUME < 电量 < CAP 时不做任何动作，所以不会在阈值附近反复断电/充电
 CAP=80
-RESUME=75
+RESUME=70
 # 高于 CAP 连续 CONFIRM 次采样才停充；低于 RESUME 连续 CONFIRM 次才恢复
 CONFIRM=2
 # 安全线：低于此值无条件充电（不等确认）

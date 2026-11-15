@@ -1,5 +1,5 @@
 #!/bin/bash
-# smbx-charge-limit —— 把电池电量控制在 RESUME%~CAP% 之间（默认 75~80%）
+# smbx-charge-limit —— 把电池电量控制在 RESUME%~CAP% 之间（默认 70~80%）
 #   到 CAP 停充；掉到 RESUME 再放开；区间内不动（死区）；
 #   且需连续 CONFIRM 次采样满足条件才切换，避免在阈值附近来回断电/充电。
 #   低于 SAFETY 无条件充电（不等待确认）。
@@ -18,7 +18,7 @@ CONF=${CONF:-/etc/default/smbx-charge-limit}
 [[ -r $CONF ]] && . "$CONF"
 
 CAP=${CAP:-80}          # 上限：到这里停止充电
-RESUME=${RESUME:-75}    # 下限：掉到这里恢复充电
+RESUME=${RESUME:-70}    # 下限：掉到这里恢复充电
 SAFETY=${SAFETY:-40}    # 安全线：低于此值无条件充电
 INTERVAL=${INTERVAL:-60}
 CONFIRM=${CONFIRM:-2}   # 连续多少次采样满足条件才切换
