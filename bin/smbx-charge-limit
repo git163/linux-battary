@@ -3,12 +3,17 @@
 #
 #   停充：电量 ≥ CAP          或 充电中电压 ≥ VOLT_STOP
 #   恢复：电量 ≤ RESUME       或 静置(|I| ≤ LOAD_QUIET)时电压 ≤ VOLT_RESUME
-#   低于 SAFETY 无条件充电（不等确认）
+#   低于 SAFETY 无条件充电（不等确认、不看驻留时间）
 #
-#   两个防抖门槛：
-#     · 连续 CONFIRM 次采样条件一致才切换（默认 2 次）
-#     · |I| > LOAD_FREEZE 视为重载，冻结判定（电压被负载拉低不可信），
-#       负载回落后自动恢复判定
+#   三层防抖：
+#     1. 连续 CONFIRM 次采样条件一致才切换（默认 2 次 ≈ 2 分钟）
+#     2. 最短驻留：一旦开始充电，至少 MIN_CHARGE_SEC 才允许停；
+#        一旦停充，至少 MIN_REST_SEC 才允许恢复（默认各 10 分钟）
+#     3. |I| > LOAD_FREEZE 视为重载，冻结判定（电压被负载拉低不可信），
+#        负载回落后自动恢复判定
+#
+#   驻留计时持久化在 /run/smbx-charge-limit.dwell，服务重启后接着算，
+#   不会因为 systemd 重启就把「才充了 3 分钟」重置成满额。
 #
 #   若 /run/smbx-drain.active 存在且未超时，仅做兜底，不干预 USB 输入。
 set -u
@@ -20,6 +25,7 @@ BAT=/sys/class/power_supply/qcom-battery
 CHARGER=/sys/class/power_supply/pm8150b-charger
 DRAIN_FLAG=/run/smbx-drain.active
 NO_MODULE=/run/smbx-charge-limit.no-module
+DWELL_FILE=/run/smbx-charge-limit.dwell
 CONF=${CONF:-/etc/default/smbx-charge-limit}
 
 # shellcheck source=/dev/null
@@ -30,14 +36,20 @@ RESUME=${RESUME:-70}           # 下限（%）：掉到这里恢复充电
 SAFETY=${SAFETY:-40}           # 安全线（%）：低于此值无条件充电
 INTERVAL=${INTERVAL:-60}       # 采样间隔（秒）
 CONFIRM=${CONFIRM:-2}          # 连续多少次采样一致才切换
+MIN_CHARGE_SEC=${MIN_CHARGE_SEC:-600}  # 开始充电后至少保持多久（秒）才允许停
+MIN_REST_SEC=${MIN_REST_SEC:-600}      # 停止充电后至少保持多久（秒）才允许恢复
 VOLT_STOP=${VOLT_STOP:-4130000}     # 充电中电压 ≥ 此值（µV）停充；0 = 只用百分比
 VOLT_RESUME=${VOLT_RESUME:-4050000} # 静置电压 ≤ 此值（µV）恢复；0 = 只用百分比
 LOAD_QUIET=${LOAD_QUIET:-80}        # |I| ≤ 此值（mA）算静置，才用电压判恢复
 LOAD_FREEZE=${LOAD_FREEZE:-300}     # |I| > 此值（mA）冻结判定
 DRAIN_MAX_AGE=${DRAIN_MAX_AGE:-43200}
 
-log() { logger -t smbx-charge-limit -- "$*"; echo "$(date '+%F %T') $*"; }
+log() { echo "$(date '+%F %T') $*"; }
 volt() { printf '%d.%03d' $(( $1 / 1000000 )) $(( ($1 % 1000000) / 1000 )); }
+fmt_dur() {
+	local s=$1
+	if (( s >= 60 )); then printf '%d分%02d秒' $(( s / 60 )) $(( s % 60 )); else printf '%d秒' "$s"; fi
+}
 
 # 模块不在（多半是内核升级后没重编）：只报一次，避免 systemd 反复重启刷日志
 if [[ ! -w $CHG || ! -w $USB ]]; then
@@ -50,16 +62,29 @@ if [[ ! -w $CHG || ! -w $USB ]]; then
 fi
 rm -f "$NO_MODULE"
 
+# ---- 驻留状态（跨服务重启继承）----
+dwell_state=
+dwell_ts=0
+if [[ -r $DWELL_FILE ]]; then
+	read -r dwell_state dwell_ts <"$DWELL_FILE" 2>/dev/null || true
+	[[ ${dwell_ts:-} =~ ^[0-9]+$ ]] || dwell_ts=0
+fi
+save_dwell() { printf '%s %s\n' "$dwell_state" "$dwell_ts" >"$DWELL_FILE" 2>/dev/null || true; }
+
 if (( VOLT_STOP > 0 && VOLT_RESUME > 0 )); then
 	log "启动：区间 ${RESUME}~${CAP}%，电压 $(volt "$VOLT_RESUME")~$(volt "$VOLT_STOP")V（静置 ≤${LOAD_QUIET}mA / 冻结 >${LOAD_FREEZE}mA），连续 ${CONFIRM} 次确认，采样 ${INTERVAL}s"
 else
 	log "启动：区间 ${RESUME}~${CAP}%（仅百分比），连续 ${CONFIRM} 次确认，采样 ${INTERVAL}s"
+fi
+if (( MIN_CHARGE_SEC > 0 || MIN_REST_SEC > 0 )); then
+	log "最短驻留：充电 ≥$(fmt_dur "$MIN_CHARGE_SEC") 才允许停，停充 ≥$(fmt_dur "$MIN_REST_SEC") 才允许恢复（安全线除外）"
 fi
 
 pending=-1        # 正在申请的切换目标（-1 = 无）
 pending_hits=0
 first_run=1
 frozen=0
+dwell_warned=-1   # 已提示过「驻留未满」的那一轮 dwell_ts，避免每分钟刷日志
 
 while :; do
 	# 模块被卸载 / 内核升级后参数节点消失，退出让 systemd 拉起
@@ -75,6 +100,7 @@ while :; do
 	uv=$(cat "$BAT/voltage_now" 2>/dev/null)
 	ua=$(cat "$BAT/current_now" 2>/dev/null)
 	ac=$(cat "$CHARGER/online" 2>/dev/null)
+	now=$(date +%s)
 
 	if ! [[ ${cap:-} =~ ^[0-9]+$ ]] || ! [[ ${uv:-} =~ ^[0-9]+$ ]]; then
 		log "读不到电量/电压，重试"
@@ -83,15 +109,28 @@ while :; do
 	fi
 	[[ ${ua:-} =~ ^-?[0-9]+$ ]] || ua=0
 	ima=$(( ua < 0 ? -ua / 1000 : ua / 1000 ))
-	need=$CONFIRM
-	(( first_run )) && need=1
-	first_run=0
 
 	cur=$(cat "$CHG" 2>/dev/null)
+
+	# ---- 驻留计时 ----
+	# 状态被外部改过（含首次启动）→ 从这一刻起算
+	if [[ $dwell_state != "$cur" || $dwell_ts -eq 0 ]]; then
+		dwell_state=$cur
+		dwell_ts=$now
+		save_dwell
+	fi
+	# charging=1 但没外部供电 = 实际没在充电，不计入充电时长
+	if (( cur == 1 && ac != 1 )); then
+		dwell_ts=$now
+		save_dwell
+	fi
+	elapsed=$(( now - dwell_ts ))
+	if (( cur == 1 )); then dwell_need=$MIN_CHARGE_SEC; else dwell_need=$MIN_REST_SEC; fi
+
 	want=$cur
 	reason=
 
-	# ---- 判定 ----
+	# ---- 判定（只看当前状态该不该翻）----
 	if (( cap <= SAFETY )); then
 		want=1
 		reason="低于安全线 ${SAFETY}%"
@@ -122,8 +161,26 @@ while :; do
 		frozen=0
 	fi
 
+	# ---- 最短驻留门槛 ----
+	# 条件想翻，但当前状态还没保持够久 → 本轮不动作（安全线不受限）。
+	# 首次采样（开机/重启后）直接套用，不等驻留，避免满电白充。
+	blocked=0
+	if (( ! first_run )) && (( dwell_need > 0 )) && (( elapsed < dwell_need )) \
+		&& [[ $want != "$cur" ]] && (( cap > SAFETY )); then
+		blocked=1
+		if (( dwell_warned != dwell_ts )); then
+			log "暂不切换（$reason）：当前 charging=$cur 已保持 $(fmt_dur "$elapsed")，未满 $(fmt_dur "$dwell_need")"
+			dwell_warned=$dwell_ts
+		fi
+	fi
+
 	# ---- 连续确认后执行 ----
-	if [[ $want != "$cur" ]]; then
+	if (( blocked )); then
+		pending=-1
+		pending_hits=0
+	elif [[ $want != "$cur" ]]; then
+		# 首次采样（开机/重启后）立刻套用，不等连续确认，避免满电白充
+		if (( first_run )); then need=1; else need=$CONFIRM; fi
 		if [[ $want == "$pending" ]]; then
 			pending_hits=$((pending_hits + 1))
 		else
@@ -133,6 +190,10 @@ while :; do
 		if (( pending_hits >= need )); then
 			if echo "$want" >"$CHG"; then
 				log "电量 ${cap}%、$(volt "$uv")V、${ima}mA → charging=$want（$reason）"
+				dwell_state=$want
+				dwell_ts=$(date +%s)
+				dwell_warned=-1
+				save_dwell
 			else
 				log "写 charging 失败"
 			fi
@@ -143,6 +204,7 @@ while :; do
 		pending=-1
 		pending_hits=0
 	fi
+	first_run=0
 
 	# ---- USB 输入兜底 ----
 	usb=$(cat "$USB" 2>/dev/null)

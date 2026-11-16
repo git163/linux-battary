@@ -69,6 +69,30 @@ show_status() {
 			$((v_resume / 1000000)) $(((v_resume % 1000000) / 1000)) \
 			$((v_stop / 1000000)) $(((v_stop % 1000000) / 1000))
 	fi
+	# 最短驻留：还剩多久才允许切换
+	local mc mr dstate dts dwell_now left need
+	mc=$(conf_var "$CONF" MIN_CHARGE_SEC 0)
+	mr=$(conf_var "$CONF" MIN_REST_SEC 0)
+	if [[ $charging == 0 || $charging == 1 ]] && [[ -r /run/smbx-charge-limit.dwell ]]; then
+		read -r dstate dts < /run/smbx-charge-limit.dwell 2>/dev/null || true
+		if [[ ${dts:-} =~ ^[0-9]+$ ]] && (( dts > 0 )); then
+			[[ $charging == 1 ]] && need=$mc || need=$mr
+			dwell_now=$(date +%s)
+			left=$(( need - (dwell_now - dts) ))
+			if (( need <= 0 )); then
+				printf '  驻留 未启用（MIN_CHARGE_SEC=0 / MIN_REST_SEC=0）\n'
+			elif (( left > 0 )); then
+				printf '  %s已保持 %d 分 %02d 秒，还需 %d 分 %02d 秒才允许切换\n' \
+					"$([[ $charging == 1 ]] && echo 充电 || echo 停充)" \
+					$(( (dwell_now - dts) / 60 )) $(( (dwell_now - dts) % 60 )) \
+					$(( left / 60 )) $(( left % 60 ))
+			else
+				printf '  %s已保持 %d 分，可随时切换\n' \
+					"$([[ $charging == 1 ]] && echo 充电 || echo 停充)" \
+					$(( (dwell_now - dts) / 60 ))
+			fi
+		fi
+	fi
 
 	echo "== 日志 =="
 	local enabled file lines
